@@ -12,6 +12,7 @@ import type { FeedbackPayload, InterviewMode } from "@/lib/careerprep-data";
 export const runtime = "nodejs";
 
 const DEFAULT_MODEL = "gpt-5-mini";
+const DEFAULT_FALLBACK_MODEL = "gpt-4.1-mini";
 const MAX_HISTORY = 8;
 const MAX_MESSAGE_CHARS = 2400;
 const MAX_HISTORY_ITEM_CHARS = 1200;
@@ -27,6 +28,8 @@ const RATE_LIMIT_ERROR =
   "CareerPrep AI is receiving high traffic. Please try again in a few moments.";
 const AUTH_ERROR =
   "CareerPrep AI is not configured correctly on the server. Please try again later.";
+const CONFIG_ERROR =
+  "CareerPrep AI server setup is incomplete. Add a valid OPENAI_API_KEY and restart the server.";
 const METHOD_NOT_ALLOWED_ERROR = "Use POST /api/careerprep.";
 
 const VALID_MODES: InterviewMode[] = [
@@ -36,10 +39,6 @@ const VALID_MODES: InterviewMode[] = [
   "project",
   "confidence",
 ];
-
-const client = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
 
 function jsonError(status: number, error: string) {
   const response: CareerPrepChatResponse = {
@@ -147,29 +146,52 @@ function extractReplyText(response: OpenAI.Responses.Response): string {
   return response.output_text?.trim() || "";
 }
 
-function getUpstreamErrorMessage(error: unknown): string {
+function getOpenAIClient(): OpenAI | null {
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+
+  if (!apiKey || apiKey === "your_openai_api_key_here") {
+    return null;
+  }
+
+  return new OpenAI({ apiKey });
+}
+
+function getUpstreamErrorDetails(error: unknown): { status: number; message: string } {
   if (error instanceof APIError) {
     if (error.status === 401 || error.status === 403) {
-      return AUTH_ERROR;
+      return { status: 500, message: AUTH_ERROR };
     }
 
     if (error.status === 429) {
-      return RATE_LIMIT_ERROR;
+      return { status: 429, message: RATE_LIMIT_ERROR };
     }
 
-    return GENERIC_UPSTREAM_ERROR;
+    return { status: 502, message: GENERIC_UPSTREAM_ERROR };
   }
 
   if (!(error instanceof Error)) {
-    return GENERIC_UPSTREAM_ERROR;
+    return { status: 502, message: GENERIC_UPSTREAM_ERROR };
   }
 
   const normalized = error.message.toLowerCase();
   if (normalized.includes("rate")) {
-    return RATE_LIMIT_ERROR;
+    return { status: 429, message: RATE_LIMIT_ERROR };
   }
 
-  return GENERIC_UPSTREAM_ERROR;
+  return { status: 502, message: GENERIC_UPSTREAM_ERROR };
+}
+
+function isModelAccessError(error: unknown): boolean {
+  if (!(error instanceof APIError)) {
+    return false;
+  }
+
+  if (![400, 403, 404].includes(error.status ?? -1)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return message.includes("model") || message.includes("not found");
 }
 
 export async function POST(request: Request) {
@@ -188,25 +210,50 @@ export async function POST(request: Request) {
 
   const { message, mode, history } = parsed.data;
 
-  if (!process.env.OPENAI_API_KEY || !client) {
-    return jsonError(500, GENERIC_UPSTREAM_ERROR);
+  const client = getOpenAIClient();
+  if (!client) {
+    return jsonError(500, CONFIG_ERROR);
   }
 
-  const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
+  const configuredModel = process.env.OPENAI_MODEL?.trim();
+  const model = configuredModel || DEFAULT_MODEL;
+  const allowFallbackModel = !configuredModel && model === DEFAULT_MODEL;
+
+  const input = [...history, { role: "user" as const, content: message }];
 
   try {
     const instructions = buildCareerPrepInstructions(mode, message);
 
-    const response = await client.responses.create({
-      model,
-      instructions,
-      input: [...history, { role: "user", content: message }],
-      store: false,
-      metadata: {
-        product: "careerprep-ai",
-        mode,
-      },
-    });
+    let response: OpenAI.Responses.Response;
+
+    try {
+      response = await client.responses.create({
+        model,
+        instructions,
+        input,
+        store: false,
+        metadata: {
+          product: "careerprep-ai",
+          mode,
+        },
+      });
+    } catch (error) {
+      if (!allowFallbackModel || !isModelAccessError(error)) {
+        throw error;
+      }
+
+      response = await client.responses.create({
+        model: DEFAULT_FALLBACK_MODEL,
+        instructions,
+        input,
+        store: false,
+        metadata: {
+          product: "careerprep-ai",
+          mode,
+          model_fallback: DEFAULT_FALLBACK_MODEL,
+        },
+      });
+    }
 
     const replyText = extractReplyText(response);
 
@@ -222,7 +269,8 @@ export async function POST(request: Request) {
 
     return NextResponse.json(success);
   } catch (error: unknown) {
-    return jsonError(502, getUpstreamErrorMessage(error));
+    const mappedError = getUpstreamErrorDetails(error);
+    return jsonError(mappedError.status, mappedError.message);
   }
 }
 
