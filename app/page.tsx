@@ -21,6 +21,9 @@ export default function Home() {
         >
           Open CareerPrep AI
         </Link>
+        <p className="mt-4 text-xs text-slate-500">
+          Created by Deepak Prabhu Nikhil Ganireddy
+        </p>
       </section>
     </main>
   );
