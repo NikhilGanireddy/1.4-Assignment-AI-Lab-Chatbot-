@@ -5,6 +5,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { FeedbackCard } from "@/components/careerprep/FeedbackCard";
 import { ModeSelector } from "@/components/careerprep/ModeSelector";
 import { PromptChips } from "@/components/careerprep/PromptChips";
+import type {
+  CareerPrepChatResponse,
+  CareerPrepHistoryMessage,
+} from "@/lib/careerprep-api";
 import {
   CHAT_EMPTY_STATE_ITEMS,
   INITIAL_GREETING,
@@ -17,9 +21,10 @@ import {
   type InterviewMode,
   type StarterPrompt,
 } from "@/lib/careerprep-data";
-import { generateMockReply } from "@/lib/mock-chatbot";
 
-const MOCK_RESPONSE_DELAY_MS = 780;
+const MAX_HISTORY_FOR_API = 8;
+const CLIENT_FALLBACK_REPLY =
+  "I’m having trouble reaching the coaching service right now. Please try again in a moment.";
 
 function createMessage(
   role: ChatRole,
@@ -74,6 +79,50 @@ function TypingIndicator() {
       <span className="text-xs text-slate-500">thinking...</span>
     </div>
   );
+}
+
+function buildHistoryForApi(messages: ChatMessage[]): CareerPrepHistoryMessage[] {
+  return messages
+    .filter((message) => message.role === "user" || message.role === "assistant")
+    .map((message) => ({
+      role: message.role,
+      content: message.content,
+    }))
+    .slice(-MAX_HISTORY_FOR_API);
+}
+
+async function requestCareerPrepReply(params: {
+  message: string;
+  mode: InterviewMode;
+  history: CareerPrepHistoryMessage[];
+}): Promise<CareerPrepChatResponse> {
+  const response = await fetch("/api/careerprep", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(params),
+  });
+
+  let data: CareerPrepChatResponse | null = null;
+
+  try {
+    data = (await response.json()) as CareerPrepChatResponse;
+  } catch {
+    return {
+      reply: null,
+      error: CLIENT_FALLBACK_REPLY,
+    };
+  }
+
+  if (!response.ok) {
+    return {
+      reply: null,
+      error: data.error || CLIENT_FALLBACK_REPLY,
+    };
+  }
+
+  return data;
 }
 
 export function ChatWindow() {
@@ -132,26 +181,38 @@ export function ChatWindow() {
     }
 
     const selectedMode = modeOverride ?? activeMode;
+    const history = buildHistoryForApi(messages);
     const userMessage = createMessage("user", trimmed);
-    const nextHistory = [...messages, userMessage];
 
-    setMessages(nextHistory);
+    setMessages((currentMessages) => [...currentMessages, userMessage]);
     setDraft("");
     setIsLoading(true);
 
     try {
-      await new Promise((resolve) => {
-        setTimeout(resolve, MOCK_RESPONSE_DELAY_MS);
+      const data = await requestCareerPrepReply({
+        message: trimmed,
+        mode: selectedMode,
+        history,
       });
 
-      const reply = await generateMockReply(trimmed, selectedMode, nextHistory);
+      if (data.error || !data.reply) {
+        const fallback = createMessage(
+          "assistant",
+          data.error || CLIENT_FALLBACK_REPLY,
+        );
+        setMessages((currentMessages) => [...currentMessages, fallback]);
+        return;
+      }
+
       const assistantMessage = createMessage(
         "assistant",
-        reply.content,
-        reply.feedback,
+        data.reply,
+        data.feedback || undefined,
       );
-
       setMessages((currentMessages) => [...currentMessages, assistantMessage]);
+    } catch {
+      const fallback = createMessage("assistant", CLIENT_FALLBACK_REPLY);
+      setMessages((currentMessages) => [...currentMessages, fallback]);
     } finally {
       setIsLoading(false);
     }
@@ -206,7 +267,9 @@ export function ChatWindow() {
             <p className="text-[11px] font-medium tracking-[0.08em] text-cyan-100 uppercase">
               Interview Coach
             </p>
-            <p className="mt-0.5 text-xs text-cyan-50">Focused on {activeModeMeta?.label}</p>
+            <p className="mt-0.5 text-xs text-cyan-50">
+              Focused on {activeModeMeta?.label}
+            </p>
           </div>
         </div>
 
